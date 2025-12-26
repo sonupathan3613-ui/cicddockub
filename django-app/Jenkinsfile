@@ -1,0 +1,82 @@
+// Jenkinsfile
+pipeline {
+  agent any
+
+  environment {
+    REGISTRY = "your-registry"
+    REPO     = "django-app"
+    IMAGE    = "${REGISTRY}/${REPO}"
+    TAG      = "${env.BUILD_NUMBER}"
+    KUBE_NAMESPACE = "prod"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Install deps & test') {
+      steps {
+        sh '''
+          python -m venv venv
+          . venv/bin/activate
+          pip install -r requirements.txt
+          python manage.py test
+        '''
+      }
+    }
+
+    stage('Build image') {
+      steps {
+        sh "docker build -t ${IMAGE}:${TAG} ."
+      }
+    }
+
+    stage('Login & push') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'REGISTRY_CREDS', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+          sh '''
+            echo $PASS | docker login ${REGISTRY} -u $USER --password-stdin
+            docker push ${IMAGE}:${TAG}
+          '''
+        }
+      }
+    }
+
+    stage('Terraform apply') {
+      steps {
+        dir('terraform') {
+          withCredentials([string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                           string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')]) {
+            sh '''
+              terraform init -input=false
+              terraform apply -auto-approve -input=false
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Deploy to Kubernetes') {
+      steps {
+        withKubeConfig([credentialsId: 'KUBE_CONFIG']) {
+          sh """
+            kubectl -n ${KUBE_NAMESPACE} set image deployment/django-app django=${IMAGE}:${TAG} --record || \
+            kubectl -n ${KUBE_NAMESPACE} apply -f k8s/
+          """
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "Deployed ${IMAGE}:${TAG} to ${KUBE_NAMESPACE}"
+    }
+    failure {
+      echo "Pipeline failed—check logs"
+    }
+  }
+}
